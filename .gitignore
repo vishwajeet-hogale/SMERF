@@ -146,3 +146,5 @@ RoadData/gt_results.json
 RoadDataTool/vis
 RoadDataTool/gt_result.json
 RoadDataTool/pred_case1_no_turbulence.json
+mmdetection3d/ckpts
+mmdetection3d/work_dirs

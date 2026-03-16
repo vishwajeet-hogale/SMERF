@@ -4,6 +4,7 @@ Supports scenario-based evaluation and metric visualization.
 """
 
 import argparse
+import glob
 import os
 import os.path as osp
 import warnings
@@ -266,6 +267,8 @@ def parse_args():
                         help="Override data.test.split in config (e.g. train, val, test).")
     parser.add_argument("--gpu", type=int, default=0,
                         help="GPU ID to use (0 is default). Use -1 for CPU inference (slower but uses less memory).")
+    parser.add_argument("--resume-from-stream", action="store_true",
+                        help="Skip inference and load streamed *.pkl predictions from --stream-dir.")
 
     parser.add_argument(
         "--cfg-options",
@@ -301,6 +304,26 @@ def _unpack_data_container(data):
         else:
             unpacked[key] = val
     return unpacked
+
+
+def _load_streamed_outputs(stream_dir):
+    """Load per-sample prediction files previously written by --stream-out."""
+    if not osp.isdir(stream_dir):
+        raise FileNotFoundError(f"Stream directory not found: {stream_dir}")
+
+    manifest_file = osp.join(stream_dir, "manifest.txt")
+    if osp.isfile(manifest_file):
+        with open(manifest_file, "r", encoding="utf-8") as f:
+            files = [line.strip() for line in f if line.strip()]
+    else:
+        files = sorted(glob.glob(osp.join(stream_dir, "*.pkl")))
+
+    if not files:
+        raise RuntimeError(f"No streamed prediction files found in: {stream_dir}")
+
+    outputs = [mmcv.load(fp) for fp in files]
+    print(f"Loaded {len(outputs)} streamed predictions from: {stream_dir}")
+    return outputs
 
 
 def _get_sample_scenario_labels(info):
@@ -349,6 +372,16 @@ def evaluate_by_scenario(dataset, outputs, eval_kwargs, out_dir):
     metric_cols = METRIC_COLS_EVAL
     all_rows = []
 
+    # Ensure scenario metadata is available even when dataset.lazy_load=True.
+    materialized = 0
+    for i in range(len(dataset.data_infos)):
+        info = dataset.data_infos[i]
+        if info.get('_lazy', False) and hasattr(dataset, '_ensure_info_loaded'):
+            dataset.data_infos[i] = dataset._ensure_info_loaded(info)
+            materialized += 1
+    if materialized > 0:
+        print(f"Materialized {materialized} lazy samples for scenario metadata.")
+
     # ---- Global ----
     print("\n==============================")
     print("GLOBAL METRICS")
@@ -369,9 +402,16 @@ def evaluate_by_scenario(dataset, outputs, eval_kwargs, out_dir):
         "topology_complexity": {}
     }
 
+    scenario_meta_count = 0
+
     for i in range(len(dataset)):
-        for stype, label in _get_sample_scenario_labels(dataset.data_infos[i]).items():
+        info = dataset.data_infos[i]
+        if info.get('scenario_meta'):
+            scenario_meta_count += 1
+        for stype, label in _get_sample_scenario_labels(info).items():
             scenarios[stype].setdefault(label, []).append(i)
+
+    print(f"Samples with scenario_meta: {scenario_meta_count}/{len(dataset)}")
 
     # ---- Per-scenario evaluation ----
     print("\n==============================")
@@ -393,9 +433,17 @@ def evaluate_by_scenario(dataset, outputs, eval_kwargs, out_dir):
             subset_outputs = [outputs[i] for i in indices]
 
             original_data_infos = dataset.data_infos
-            dataset.data_infos = [dataset.data_infos[i] for i in indices]
-            metrics = dataset.evaluate(subset_outputs, eval_kwargs=eval_kwargs)
-            dataset.data_infos = original_data_infos
+            try:
+                dataset.data_infos = [dataset.data_infos[i] for i in indices]
+                metrics = dataset.evaluate(subset_outputs, eval_kwargs=eval_kwargs)
+            except ValueError as exc:
+                # OpenLane-V2 topology eval can be undefined for tiny subsets.
+                if 'need at least one array to concatenate' in str(exc):
+                    print(f"  {category}: skipped ({len(indices)} samples, invalid topology subset)")
+                    continue
+                raise
+            finally:
+                dataset.data_infos = original_data_infos
 
             row = {'category': category, 'samples': len(indices)}
             row.update({k: metrics.get(k) for k in metric_cols})
@@ -497,11 +545,6 @@ def main():
         cfg.data.test.split = args.split
         print(f"Overriding data.test.split = '{args.split}'")
 
-    # ---- Model ----
-    print("Building model...")
-    model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"))
-    checkpoint = load_checkpoint(model, args.checkpoint, map_location="cpu")
-
     # ---- Dataset ----
     print("Building dataset...")
     dataset = build_dataset(cfg.data.test)
@@ -510,44 +553,61 @@ def main():
         print(f"Limiting to first {args.max_samples} of {len(dataset)} samples")
         dataset.data_infos = dataset.data_infos[:args.max_samples]
 
-    if "CLASSES" in checkpoint.get("meta", {}):
-        model.CLASSES = checkpoint["meta"]["CLASSES"]
-    else:
-        model.CLASSES = dataset.CLASSES
-
-    # ---- DataLoader ----
-    print("Building dataloader...")
-    data_loader = build_dataloader(
-        dataset,
-        samples_per_gpu=1,
-        workers_per_gpu=args.workers_per_gpu,
-        dist=False,
-        shuffle=False,
-    )
-
-    # Use CPU or GPU based on --gpu flag
-    if args.gpu < 0:
-        print("Using CPU inference (slower but memory-efficient for 4GB GPU constraints).")
-        # Keep model on CPU
-        model.eval()
-    else:
-        print(f"Using GPU {args.gpu}")
-        model = MMDataParallel(model, device_ids=[args.gpu])
-
-    # ---- Inference ----
-    print("Running inference...")
-    effective_stream_out = bool(args.stream_out)
     stream_dir = args.stream_dir if args.stream_dir else osp.join(args.out_dir, "stream_outputs")
+    effective_stream_out = bool(args.stream_out)
 
-    outputs, streamed_files = run_inference(
-        model,
-        data_loader,
-        gpu_id=args.gpu,
-        out_dir=args.out_dir,
-        stream_out=effective_stream_out,
-        stream_dir=stream_dir,
-        clear_cache_interval=args.clear_cache_interval,
-    )
+    if args.resume_from_stream:
+        print("Resuming from streamed predictions (skipping inference)...")
+        outputs = _load_streamed_outputs(stream_dir)
+        streamed_files = []
+
+        if len(outputs) != len(dataset):
+            if len(outputs) < len(dataset):
+                print(f"Aligning dataset to streamed outputs: {len(dataset)} -> {len(outputs)}")
+                dataset.data_infos = dataset.data_infos[:len(outputs)]
+            else:
+                print(f"Aligning outputs to dataset size: {len(outputs)} -> {len(dataset)}")
+                outputs = outputs[:len(dataset)]
+    else:
+        # ---- Model ----
+        print("Building model...")
+        model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"))
+        checkpoint = load_checkpoint(model, args.checkpoint, map_location="cpu")
+
+        if "CLASSES" in checkpoint.get("meta", {}):
+            model.CLASSES = checkpoint["meta"]["CLASSES"]
+        else:
+            model.CLASSES = dataset.CLASSES
+
+        # ---- DataLoader ----
+        print("Building dataloader...")
+        data_loader = build_dataloader(
+            dataset,
+            samples_per_gpu=1,
+            workers_per_gpu=args.workers_per_gpu,
+            dist=False,
+            shuffle=False,
+        )
+
+        # Use CPU or GPU based on --gpu flag
+        if args.gpu < 0:
+            print("Using CPU inference (slower but memory-efficient for 4GB GPU constraints).")
+            model.eval()
+        else:
+            print(f"Using GPU {args.gpu}")
+            model = MMDataParallel(model, device_ids=[args.gpu])
+
+        # ---- Inference ----
+        print("Running inference...")
+        outputs, streamed_files = run_inference(
+            model,
+            data_loader,
+            gpu_id=args.gpu,
+            out_dir=args.out_dir,
+            stream_out=effective_stream_out,
+            stream_dir=stream_dir,
+            clear_cache_interval=args.clear_cache_interval,
+        )
 
     # ---- Save ----
     if args.out and outputs is not None:
