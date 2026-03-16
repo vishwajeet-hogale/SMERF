@@ -21,7 +21,12 @@
 # ==============================================================================
 import os
 import numpy as np
-import sparse
+
+try:
+    import sparse
+    SPARSE_AVAILABLE = True
+except ImportError:
+    SPARSE_AVAILABLE = False
 
 import mmcv
 from mmdet.datasets import PIPELINES
@@ -50,6 +55,11 @@ class CustomLoadSDMapRasterFromFiles(LoadMultiViewImageFromFiles):
         elif file_ext == '.npy':
             map_raster = np.load(filename)
         elif file_ext == '.npz':
+            if not SPARSE_AVAILABLE:
+                raise ImportError(
+                    'Loading .npz files requires the "sparse" package. '
+                    'Install it with: pip install sparse'
+                )
             map_raster_s_ = sparse.load_npz(filename)
             map_raster = map_raster_s_.todense()
         else:

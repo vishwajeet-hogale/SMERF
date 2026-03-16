@@ -295,8 +295,8 @@ test_pipeline = [
     dict(type='CustomCollect3D', keys=['img', 'map_graph', 'onehot_category',])
 ]
 
-dataset_type = 'OpenLaneV2_subset_A_GraphicalSDMapDataset'
-data_root = '../data/OpenLane-V2/'
+dataset_type = 'OpenLaneJSONDataset'
+data_root = 'D:/TopoNet/Data/Openlnae/'
 
 data = dict(
     samples_per_gpu=1,
@@ -305,7 +305,6 @@ data = dict(
         type=dataset_type,
         data_root=data_root,
         ann_file=data_root + 'data_dict_subset_A_train.pkl',
-        # ann_file=data_root + 'data_dict_sample_train.pkl',
         map_dir_prefix='sd_map_graph_all',
         map_file_ext='pkl',
         pipeline=train_pipeline,
@@ -317,7 +316,6 @@ data = dict(
         type=dataset_type,
         data_root=data_root,
         ann_file=data_root + 'data_dict_subset_A_val.pkl',
-        # ann_file=data_root + 'data_dict_sample_train.pkl',
         map_dir_prefix='sd_map_graph_all',
         map_file_ext='pkl',
         pipeline=test_pipeline,
@@ -329,7 +327,6 @@ data = dict(
         type=dataset_type,
         data_root=data_root,
         ann_file=data_root + 'data_dict_subset_A_val.pkl',
-        # ann_file=data_root + 'data_dict_sample_train.pkl',
         map_dir_prefix='sd_map_graph_all',
         map_file_ext='pkl',
         pipeline=test_pipeline,
